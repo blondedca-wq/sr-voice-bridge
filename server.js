@@ -2,7 +2,7 @@
 // SecondRing Voice Receptionist I - ConversationRelay bridge.
 // HTTP: /relay/incoming (TwiML), /relay/health (JSON).
 // WS:   /relay/ws (Twilio ConversationRelay).
-// Binds 127.0.0.1 only; Caddy terminates TLS and proxies /relay/*.
+// Caddy terminates TLS and proxies /relay/* to this process.
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
@@ -10,6 +10,9 @@ const { loadConfig } = require('./supabase');
 const { Session } = require('./session');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
+// Caddy runs in a Docker container here, so the bridge listens on the docker
+// network gateway, not loopback. ufw keeps this port off the public internet.
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || 'auto.secondring.ca';
 // Where callers go if this machine is disabled/paused: the proven n8n Gather flow.
 const FALLBACK_TWIML_URL = process.env.FALLBACK_TWIML_URL || '';
@@ -81,6 +84,6 @@ wss.on('connection', (ws) => {
 process.on('uncaughtException', (e) => console.error('[fatal-ish] ' + (e.stack || e.message)));
 process.on('unhandledRejection', (e) => console.error('[rejection] ' + (e && e.message ? e.message : e)));
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log('sr-voice-bridge listening on 127.0.0.1:' + PORT + ' (public wss://' + PUBLIC_HOST + '/relay/ws)');
+server.listen(PORT, BIND_HOST, () => {
+  console.log('sr-voice-bridge listening on ' + BIND_HOST + ':' + PORT + ' (public wss://' + PUBLIC_HOST + '/relay/ws)');
 });
