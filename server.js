@@ -14,7 +14,7 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 // network gateway, not loopback. ufw keeps this port off the public internet.
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || 'auto.secondring.ca';
-// Where callers go if this machine is disabled/paused: the proven n8n Gather flow.
+// Where callers go if this machine is disabled/paused/observing: the proven n8n Gather flow.
 const FALLBACK_TWIML_URL = process.env.FALLBACK_TWIML_URL || '';
 
 function xmlEscape(s) {
@@ -22,25 +22,38 @@ function xmlEscape(s) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
+function fallbackTwiml() {
+  if (FALLBACK_TWIML_URL) {
+    return '<?xml version="1.0" encoding="UTF-8"?><Response><Redirect>' +
+      xmlEscape(FALLBACK_TWIML_URL) + '</Redirect></Response>';
+  }
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now. Please try again shortly.</Say></Response>';
+}
+
 async function twimlFor() {
   let cfg = null;
   try { cfg = await loadConfig(); } catch (e) {
     console.error('[twiml] config load failed: ' + e.message);
   }
-  const enabled = cfg && cfg.enabled !== false && cfg.mode !== 'paused' && cfg.mode !== 'observe';
-  if (!enabled) {
-    if (FALLBACK_TWIML_URL) {
-      return '<?xml version="1.0" encoding="UTF-8"?><Response><Redirect>' +
-        xmlEscape(FALLBACK_TWIML_URL) + '</Redirect></Response>';
-    }
-    return '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now. Please try again shortly.</Say></Response>';
+  // The notch (tenant_machines): only 'approval_required' and 'autonomous' answer live.
+  // 'observe' and paused/disabled hand the call to the n8n flow untouched.
+  const live = cfg && cfg.enabled && (cfg.mode === 'approval_required' || cfg.mode === 'autonomous');
+  if (!live) return fallbackTwiml();
+
+  const kv = cfg.kv || {};
+  const p = cfg.profile || {};
+  const greeting = kv.greeting ||
+    ('Thanks for calling ' + (p.business_name || 'us') + '. How can I help you today?');
+  // machine_configs stores Say-style names like "Polly.Joanna-Neural";
+  // ConversationRelay wants ttsProvider="Amazon" voice="Joanna-Neural".
+  let voiceAttrs = '';
+  if (typeof kv.tts_voice === 'string' && kv.tts_voice.indexOf('Polly.') === 0) {
+    voiceAttrs = ' ttsProvider="Amazon" voice="' + xmlEscape(kv.tts_voice.slice(6)) + '"';
   }
-  const c = (cfg && cfg.config) || {};
-  const greeting = c.greeting || c.welcome_greeting ||
-    ('Thanks for calling ' + (c.business_name || 'us') + '. How can I help you today?');
   return '<?xml version="1.0" encoding="UTF-8"?><Response><Connect>' +
     '<ConversationRelay url="wss://' + PUBLIC_HOST + '/relay/ws"' +
     ' welcomeGreeting="' + xmlEscape(greeting) + '"' +
+    voiceAttrs +
     ' interruptible="speech" dtmfDetection="true" />' +
     '</Connect></Response>';
 }
