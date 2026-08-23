@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # sr-voice-bridge watchdog. Cron: every minute.
 # Restarts the service if the health endpoint stops answering.
-# Logs to journald via logger so it shows up next to the service logs.
+# NOTE: the bridge binds the docker gateway (BIND_HOST in .env), not loopback.
+# Keep this URL in sync with BIND_HOST.
 
 set -u
-HEALTH="http://127.0.0.1:8080/relay/health"
+HEALTH="http://172.18.0.1:8080/relay/health"
 
 if curl -fsS -m 5 "$HEALTH" > /dev/null 2>&1; then
   exit 0
