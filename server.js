@@ -6,7 +6,7 @@
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const { loadConfig } = require('./supabase');
+const { loadConfig, lookupContact } = require('./supabase');
 const { Session } = require('./session');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -30,7 +30,7 @@ function fallbackTwiml() {
   return '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now. Please try again shortly.</Say></Response>';
 }
 
-async function twimlFor() {
+async function twimlFor(fromNumber) {
   let cfg = null;
   try { cfg = await loadConfig(); } catch (e) {
     console.error('[twiml] config load failed: ' + e.message);
@@ -42,8 +42,15 @@ async function twimlFor() {
 
   const kv = cfg.kv || {};
   const p = cfg.profile || {};
-  const greeting = kv.greeting ||
+  let greeting = kv.greeting ||
     ('Thanks for calling ' + (p.business_name || 'us') + '. How can I help you today?');
+  // Known callers get greeted by name before they say a word.
+  const contact = fromNumber ? await lookupContact(fromNumber) : null;
+  if (contact && contact.name) {
+    const first = String(contact.name).trim().split(/\s+/)[0];
+    greeting = 'Hi ' + first + '! ' + greeting;
+    console.log('[twiml] known caller ' + first + ', personalized greeting');
+  }
   // machine_configs stores Say-style names like "Polly.Joanna-Neural";
   // ConversationRelay wants ttsProvider="Amazon" voice="Joanna-Neural".
   let voiceAttrs = '';
@@ -77,7 +84,9 @@ const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (d) => { body += d; });
     req.on('end', async () => {
-      const twiml = await twimlFor();
+      let from = null;
+      try { from = new URLSearchParams(body).get('From'); } catch {}
+      const twiml = await twimlFor(from);
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml);
     });
