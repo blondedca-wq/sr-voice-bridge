@@ -1,0 +1,21 @@
+[Unit]
+Description=SecondRing Voice Receptionist bridge (ConversationRelay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/sr-voice-bridge
+EnvironmentFile=/opt/sr-voice-bridge/.env
+ExecStart=/usr/bin/env node server.js
+Restart=always
+RestartSec=3
+# Protect the 1 GB box: the bridge gets throttled at 160M and killed at 220M,
+# long before it can starve n8n or trigger a box-wide OOM storm.
+MemoryHigh=160M
+MemoryMax=220M
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
