@@ -1,14 +1,22 @@
 'use strict';
 // The brain. One Session per ConversationRelay websocket = one phone call.
 // Day 7: intents, tenant-profile answers, human-realism, caller identification.
+// Day 8: real actions (contacts/jobs/leads), human takeover mid-call, owner
+//        alerts behind the send gate, and a true Watch mode (records + grades,
+//        never acts).
 
 const { loadConfig, lookupContact, logCallStart, logCallEnd, logEvent } = require('./supabase');
+const actions = require('./actions');
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 
 const INTENTS = ['book', 'quote', 'emergency', 'existing_customer', 'message', 'other'];
 const TAG_RE = /^\s*\[intent:([a-z_]+)\]\s*/;
+
+// callSid -> { handoff: bool, number: string, reason: string }
+// server.js reads this when Twilio hits /relay/action after the session ends.
+const handoffs = new Map();
 
 function asList(v) {
   if (Array.isArray(v)) return v;
@@ -19,6 +27,7 @@ function asList(v) {
 function buildSystem(cfg, contact, callerNumber) {
   const kv = cfg.kv || {};
   const p = cfg.profile || {};
+  const observe = cfg.mode === 'observe';
   const biz = p.business_name || 'the business';
   const lines = [];
 
@@ -59,6 +68,13 @@ function buildSystem(cfg, contact, callerNumber) {
   lines.push('- emergency: ADDRESS FIRST, then what is happening. Reassure. Tell them the owner is being alerted right now.');
   lines.push('- existing_customer: greet by name, handle whatever they need.');
   lines.push('- message: their name, best number, and the message. Confirm you have it.');
+  if (observe) {
+    lines.push('');
+    lines.push('TRIAL MODE (hard rule for this call):');
+    lines.push('- You may take details and messages, but NEVER promise that anything is booked,');
+    lines.push('  scheduled, sent, or alerted. The only promise allowed: "I will pass this to the owner');
+    lines.push('  and they will get back to you." Do not offer to transfer the call.');
+  }
   lines.push('');
   lines.push('STYLE (a caller must never sense an AI):');
   lines.push('- Warm, competent, quick. Contractions are fine. One or two short sentences per turn, never more than three.');
@@ -106,6 +122,9 @@ class Session {
     this.intents = [];
     this.escalated = false;
     this.escalateReason = null;
+    this.handingOff = false;
+    this.emergencyAlerted = false;
+    this.failStreak = 0;
     this.timer = null;
     ws.on('message', (data) => this.onMessage(data).catch(e => console.error('[session] ' + e.message)));
     ws.on('close', () => this.onClose());
@@ -131,11 +150,12 @@ class Session {
       this.cfg = results[0];
       this.contact = results[1];
       console.log('[call] setup ' + this.callSid + ' from ' + msg.from +
-        (this.contact ? ' KNOWN=' + this.contact.name : ' new-caller'));
+        (this.contact ? ' KNOWN=' + this.contact.name : ' new-caller') +
+        ' mode=' + this.cfg.mode);
       logCallStart(this.callSid, msg.from, msg.to, this.contact);
       logEvent(this.callSid, 'voice_call_started',
         (this.contact ? 'Existing customer ' + this.contact.name : 'New caller') + ' on the line',
-        { from: msg.from, engine: 'conversation_relay', known: !!this.contact });
+        { from: msg.from, engine: 'conversation_relay', known: !!this.contact, mode: this.cfg.mode });
       const maxSec = Number(this.cfg.kv.max_call_seconds) || 480;
       this.timer = setTimeout(() => this.wrapUp(), maxSec * 1000);
     } else if (msg.type === 'prompt') {
@@ -147,22 +167,54 @@ class Session {
     }
   }
 
+  // Day 8: a matched keyword now actually hands the call to a human.
   noteEscalation(userText) {
     if (this.escalated || !this.cfg) return;
     const kv = this.cfg.kv || {};
-    const hit = matchKeyword(userText, kv.emergency_transfer_on) || matchKeyword(userText, kv.transfer_to_human_on);
-    if (hit) {
-      this.escalated = true;
-      this.escalateReason = hit;
-      logEvent(this.callSid, 'voice_escalation_flagged', 'Caller said "' + hit + '"', { keyword: hit });
-    }
+    const emergencyHit = matchKeyword(userText, kv.emergency_transfer_on);
+    const humanHit = matchKeyword(userText, kv.transfer_to_human_on);
+    const hit = emergencyHit || humanHit;
+    if (!hit) return;
+    this.escalated = true;
+    this.escalateReason = hit;
+    logEvent(this.callSid, 'voice_escalation_flagged', 'Caller said "' + hit + '"',
+      { keyword: hit, emergency: !!emergencyHit });
+    this.handOff(emergencyHit ? 'emergency keyword: ' + hit : 'asked for a person: ' + hit, !!emergencyHit);
   }
 
   noteIntent(tag) {
     if (!INTENTS.includes(tag)) return;
-    if (this.intents[this.intents.length - 1] === tag) return;
-    this.intents.push(tag);
-    logEvent(this.callSid, 'voice_intent', 'Intent: ' + tag, { intent: tag, turn: Math.ceil(this.history.length / 2) });
+    if (this.intents[this.intents.length - 1] !== tag) {
+      this.intents.push(tag);
+      logEvent(this.callSid, 'voice_intent', 'Intent: ' + tag, { intent: tag, turn: Math.ceil(this.history.length / 2) });
+    }
+    if (tag === 'emergency' && !this.emergencyAlerted) {
+      this.emergencyAlerted = true;
+      actions.emergencyAlert(this).catch(e => console.error('[actions] emergencyAlert: ' + e.message));
+    }
+  }
+
+  // Speak a short line, then end the ConversationRelay session with handoff data.
+  // Twilio then requests /relay/action, which dials the escalation number.
+  handOff(reason, isEmergency) {
+    if (this.handingOff || !this.cfg) return;
+    const kv = this.cfg.kv || {};
+    const number = kv.escalation_number;
+    if (this.cfg.mode === 'observe' || !number) {
+      // Watch never transfers; and with no number there is nothing to dial.
+      logEvent(this.callSid, this.cfg.mode === 'observe' ? 'voice_action_held' : 'voice_handoff_unconfigured',
+        (this.cfg.mode === 'observe' ? 'WATCH: would have handed the call to a human (' : 'No escalation number set; cannot hand off (') + reason + ')',
+        { held: this.cfg.mode === 'observe', reason: reason });
+      return;
+    }
+    this.handingOff = true;
+    handoffs.set(this.callSid, { handoff: true, number: number, reason: reason });
+    logEvent(this.callSid, 'voice_handoff', 'Handing the call to a human: ' + reason,
+      { number_last4: String(number).slice(-4), reason: reason, emergency: !!isEmergency });
+    if (this.abort) this.abort.abort();
+    this.send({ type: 'text', token: 'One moment - I am connecting you now. It will just be a second.', last: true });
+    actions.escalationAlert(this, reason).catch(e => console.error('[actions] escalationAlert: ' + e.message));
+    setTimeout(() => this.send({ type: 'end', handoffData: JSON.stringify({ reason: reason }) }), 2500);
   }
 
   wrapUp() {
@@ -172,6 +224,7 @@ class Session {
 
   async respond(userText) {
     this.noteEscalation(userText);
+    if (this.handingOff) return;
     this.history.push({ role: 'user', content: userText });
     const cap = this.maxTurns();
     if (this.history.length > cap) this.history.splice(0, this.history.length - cap);
@@ -247,6 +300,7 @@ class Session {
       }
       if (pending.trim()) this.send({ type: 'text', token: pending, last: false });
       this.send({ type: 'text', token: '', last: true });
+      this.failStreak = 0;
       const ms = Date.now() - t0;
       const ttft = firstToken ? firstToken - t0 : ms;
       console.log('[call] turn ' + this.callSid + ' ttft=' + ttft + 'ms total=' + ms + 'ms chars=' + full.length +
@@ -256,7 +310,16 @@ class Session {
         console.log('[call] interrupted ' + this.callSid);
       } else {
         console.error('[call] respond failed: ' + e.message);
-        this.send({ type: 'text', token: 'Sorry, I had trouble hearing that. Could you say it again?', last: true });
+        this.failStreak++;
+        if (this.failStreak >= 2) {
+          // Confidence has dropped: stop apologising and get a human on the line.
+          logEvent(this.callSid, 'voice_confidence_drop', 'Two failed turns in a row - escalating');
+          this.escalated = true;
+          this.escalateReason = 'low_confidence';
+          this.handOff('the assistant had trouble on this call', false);
+        } else {
+          this.send({ type: 'text', token: 'Sorry, I had trouble hearing that. Could you say it again?', last: true });
+        }
       }
     } finally {
       if (this.abort === ac) this.abort = null;
@@ -285,8 +348,13 @@ class Session {
       });
       logEvent(this.callSid, 'voice_call_ended', 'Call ended after ' + turns + ' turns',
         { turns: turns, duration_sec: dur, intents: this.intents, escalated: this.escalated });
+      // Day 8: the action layer - extraction, grading, contacts/jobs/leads, owner alert.
+      actions.processCall(this).catch(e => console.error('[actions] processCall: ' + e.message));
+      // Handoff entries are consumed by /relay/action; clean up stragglers later.
+      const sid = this.callSid;
+      setTimeout(() => handoffs.delete(sid), 120000);
     }
   }
 }
 
-module.exports = { Session };
+module.exports = { Session, handoffs };
