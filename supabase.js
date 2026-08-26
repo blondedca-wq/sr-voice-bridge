@@ -1,18 +1,26 @@
 'use strict';
 // Supabase access for the voice bridge.
-// Schema facts (verified against the live DB, Aug 23):
+// Schema facts (verified against the live DB, Aug 26):
 //   tenant_machines: enabled bool, mode text  <- the owner's notch
 //   machine_configs: key/value rows per machine (greeting, hours_text, services, ...)
-//   sr_tenant_profile(p_tenant uuid) -> jsonb  (business_name, owner_name, booking_link, ...)
+//   sr_tenant_profile(p_tenant uuid) -> jsonb  (business_name, owner_name, ...)
 //   contacts: phone_e164, name, notes, opted_out_at, last_contact_at
-//   voice_calls: call_sid, contact_id, caller_name, transcript, turns, summary,
-//                escalated, escalate_reason, started_at, ended_at, duration_sec
+//   voice_calls: call_sid, contact_id, caller_name, service, urgency, grade, outcome,
+//                transcript, turns, summary, escalated, escalate_reason,
+//                started_at, ended_at, duration_sec
+//   leads: caller_number, call_sid, contact_id, machine_id, status,
+//          ai_job_type, ai_urgency, ai_summary, message
 //   events: event_type, subject_type, subject_id, summary, payload, machine_id, ai_model
+//   Guardrail RPCs (schema v4+, finally invoked as of Day 8):
+//     sr_gate(tenant, machine_key, action, phone, value_cents, subject_type, subject_id, message_text) -> jsonb {allowed, reason, ...}
+//     sr_is_emergency(tenant, text) -> bool      sr_in_quiet_hours(tenant) -> bool
+//     sr_upsert_contact / sr_open_job / sr_request_approval
 // Logging must NEVER crash a live call: every write is wrapped and failures only journal.
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const MACHINE_ID = process.env.MACHINE_ID;
+const MACHINE_KEY = process.env.MACHINE_KEY || 'voice_receptionist';
 const TENANT_ID = process.env.TENANT_ID;
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 
@@ -33,7 +41,14 @@ async function sbRpc(fn, args) {
     method: 'POST', headers: HEADERS, body: JSON.stringify(args)
   });
   if (!res.ok) throw new Error('RPC ' + fn + ' -> ' + res.status);
-  return res.json();
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+// Best-effort RPC: null on any failure, never throws.
+async function sbRpcSafe(fn, args) {
+  try { return await sbRpc(fn, args); }
+  catch (e) { console.error('[supabase] rpc ' + fn + ' failed: ' + e.message); return null; }
 }
 
 let cache = { at: 0, cfg: null };
@@ -81,8 +96,10 @@ async function tryInsert(table, row) {
       body: JSON.stringify(row)
     });
     if (!res.ok) console.error('[supabase] insert ' + table + ' -> ' + res.status + ': ' + (await res.text()).slice(0, 300));
+    return res.ok;
   } catch (e) {
     console.error('[supabase] insert ' + table + ' error: ' + e.message);
+    return false;
   }
 }
 
@@ -129,4 +146,59 @@ function logEvent(callSid, type, summary, payload) {
   });
 }
 
-module.exports = { loadConfig, lookupContact, logCallStart, logCallEnd, logEvent };
+// ---------- Day 8: guardrail + action RPCs (built in schema v4, invoked at last) ----------
+
+// The send gate. Returns { allowed, reason, ... } or null if the RPC itself failed.
+// A null gate result is treated by callers as "blocked" for customer numbers and
+// "allowed" for the owner's own number on emergencies - the owner must still hear
+// about an emergency even if the platform DB is unreachable.
+function gate(action, phone, messageText, callSid) {
+  return sbRpcSafe('sr_gate', {
+    p_tenant: TENANT_ID, p_machine_key: MACHINE_KEY, p_action: action,
+    p_phone: phone || null, p_value_cents: null,
+    p_subject_type: 'voice_call', p_subject_id: callSid || null,
+    p_message_text: messageText || null
+  });
+}
+
+function isEmergencyText(text) {
+  return sbRpcSafe('sr_is_emergency', { p_tenant: TENANT_ID, p_text: text });
+}
+
+function inQuietHours() {
+  return sbRpcSafe('sr_in_quiet_hours', { p_tenant: TENANT_ID });
+}
+
+// jsonb result shape is defensive-parsed by callers.
+function upsertContact(phone, name, notes) {
+  return sbRpcSafe('sr_upsert_contact', {
+    p_tenant: TENANT_ID, p_phone: phone, p_name: name || null,
+    p_source: 'voice_receptionist', p_notes: notes || null, p_touch: true
+  });
+}
+
+function openJob(contactId, description, address, scheduledFor) {
+  return sbRpcSafe('sr_open_job', {
+    p_tenant: TENANT_ID, p_contact: contactId, p_description: description,
+    p_address: address || null, p_status: 'lead',
+    p_scheduled_for: scheduledFor || null
+  });
+}
+
+function requestApproval(actionType, summary, payload, callSid) {
+  return sbRpcSafe('sr_request_approval', {
+    p_tenant: TENANT_ID, p_machine_key: MACHINE_KEY, p_action_type: actionType,
+    p_summary: summary, p_payload: payload || {},
+    p_subject_type: 'voice_call', p_subject_id: callSid || null
+  });
+}
+
+function insertLead(row) {
+  return tryInsert('leads', { tenant_id: TENANT_ID, machine_id: MACHINE_ID, ...row });
+}
+
+module.exports = {
+  loadConfig, lookupContact, logCallStart, logCallEnd, logEvent,
+  gate, isEmergencyText, inQuietHours, upsertContact, openJob,
+  requestApproval, insertLead
+};
