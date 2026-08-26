@@ -1,20 +1,20 @@
 'use strict';
-// SecondRing Voice Receptionist I - ConversationRelay bridge.
-// HTTP: /relay/incoming (TwiML), /relay/health (JSON).
+// SecondRing Voice Receptionist - ConversationRelay bridge.
+// HTTP: /relay/incoming (TwiML), /relay/action (post-session handoff), /relay/health (JSON).
 // WS:   /relay/ws (Twilio ConversationRelay).
 // Caddy terminates TLS and proxies /relay/* to this process.
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { loadConfig, lookupContact } = require('./supabase');
-const { Session } = require('./session');
+const { Session, handoffs } = require('./session');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 // Caddy runs in a Docker container here, so the bridge listens on the docker
 // network gateway, not loopback. ufw keeps this port off the public internet.
 const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || 'auto.secondring.ca';
-// Where callers go if this machine is disabled/paused/observing: the proven n8n Gather flow.
+// Where callers go if this machine is disabled/paused: the proven n8n Gather flow.
 const FALLBACK_TWIML_URL = process.env.FALLBACK_TWIML_URL || '';
 
 function xmlEscape(s) {
@@ -35,9 +35,12 @@ async function twimlFor(fromNumber) {
   try { cfg = await loadConfig(); } catch (e) {
     console.error('[twiml] config load failed: ' + e.message);
   }
-  // The notch (tenant_machines): only 'approval_required' and 'autonomous' answer live.
-  // 'observe' and paused/disabled hand the call to the n8n flow untouched.
-  const live = cfg && cfg.enabled && (cfg.mode === 'approval_required' || cfg.mode === 'autonomous');
+  // The notch (tenant_machines):
+  //   autonomous / approval_required -> AI answers with full or gated actions.
+  //   observe (Watch, Day 8)         -> AI answers, records and grades, actions held.
+  //   paused / disabled              -> the n8n Gather flow takes the call untouched.
+  const live = cfg && cfg.enabled &&
+    (cfg.mode === 'approval_required' || cfg.mode === 'autonomous' || cfg.mode === 'observe');
   if (!live) return fallbackTwiml();
 
   const kv = cfg.kv || {};
@@ -57,12 +60,28 @@ async function twimlFor(fromNumber) {
   if (typeof kv.tts_voice === 'string' && kv.tts_voice.indexOf('Polly.') === 0) {
     voiceAttrs = ' ttsProvider="Amazon" voice="' + xmlEscape(kv.tts_voice.slice(6)) + '"';
   }
-  return '<?xml version="1.0" encoding="UTF-8"?><Response><Connect>' +
+  return '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+    '<Connect action="https://' + PUBLIC_HOST + '/relay/action">' +
     '<ConversationRelay url="wss://' + PUBLIC_HOST + '/relay/ws"' +
     ' welcomeGreeting="' + xmlEscape(greeting) + '"' +
     voiceAttrs +
     ' interruptible="speech" dtmfDetection="true" />' +
     '</Connect></Response>';
+}
+
+// Called by Twilio when the ConversationRelay session ends. If the session
+// asked for a human, dial the escalation number; otherwise end the call.
+function actionTwiml(callSid) {
+  const h = callSid ? handoffs.get(callSid) : null;
+  if (h && h.handoff && h.number) {
+    handoffs.delete(callSid);
+    console.log('[action] handoff ' + callSid + ' -> ...' + String(h.number).slice(-4) + ' (' + h.reason + ')');
+    return '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+      '<Dial timeout="25">' + xmlEscape(h.number) + '</Dial>' +
+      '<Say>Sorry, no one could pick up right now. The owner has your details and will call you straight back.</Say>' +
+      '</Response>';
+  }
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>';
 }
 
 let liveSessions = 0;
@@ -89,6 +108,17 @@ const server = http.createServer((req, res) => {
       const twiml = await twimlFor(from);
       res.writeHead(200, { 'Content-Type': 'text/xml' });
       res.end(twiml);
+    });
+    return;
+  }
+  if (url === '/relay/action' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (d) => { body += d; });
+    req.on('end', () => {
+      let callSid = null;
+      try { callSid = new URLSearchParams(body).get('CallSid'); } catch {}
+      res.writeHead(200, { 'Content-Type': 'text/xml' });
+      res.end(actionTwiml(callSid));
     });
     return;
   }
