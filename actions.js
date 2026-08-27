@@ -108,7 +108,14 @@ sb.logEvent(callSid, 'voice_quiet_hours_bypassed',
 { action: action || 'owner_alert', gate: g, sent: ok });
 return ok;
 }
-sb.logEvent(callSid, 'voice_send_blocked', 'Owner alert held back by gate: ' + reason,
+if (/approval/i.test(reason) && !optedOut) {
+const ok = await sendSms(to, body);
+sb.logEvent(callSid, 'voice_approval_alert_sent',
+'Ask-me: approval request texted to the owner (' + reason + ')',
+{ action: action || 'owner_alert', gate: g, sent: ok });
+return ok;
+}
+  sb.logEvent(callSid, 'voice_send_blocked', 'Owner alert held back by gate: ' + reason,
 { action: action || 'owner_alert', gate: g });
 return false;
 }
