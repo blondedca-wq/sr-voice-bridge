@@ -27,8 +27,7 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
 function asText(v, cap) { return v == null ? null : String(v).slice(0, cap || 300); }
 
 function transcriptText(history) {
-return history.map(m => (m.role === 'user' ? 'Caller: ' : 'Receptionist: ') + m.content).join('
-').slice(0, 12000);
+return history.map(m => (m.role === 'user' ? 'Caller: ' : 'Receptionist: ') + m.content).join('\n').slice(0, 12000);
 }
 
 // One cheap non-streaming call over the finished transcript -> structured facts.
@@ -54,8 +53,7 @@ kv.grading_notes ? 'Business-specific grading notes: ' + kv.grading_notes : '',
 'above are correct, given how clear and complete the transcript is. A short, garbled, or',
 'ambiguous call is low confidence even if you filled every field.',
 'Use null for anything the transcript does not actually contain. Never invent.'
-].filter(Boolean).join('
-');
+].filter(Boolean).join('\n');
 const res = await fetch('https://api.anthropic.com/v1/messages', {
 method: 'POST',
 headers: {
@@ -71,7 +69,7 @@ messages: [{ role: 'user', content: transcriptText(session.history) }]
 if (!res.ok) throw new Error('extract ' + res.status);
 const data = await res.json();
 let text = (data.content && data.content[0] && data.content[0].text) || '';
-const m = text.match(/{[sS]*}/);
+const m = text.match(/\{[\s\S]*\}/);
 if (!m) throw new Error('extract: no JSON in reply');
 return JSON.parse(m[0]);
 }
