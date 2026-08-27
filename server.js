@@ -53,7 +53,7 @@ let greeting = kv.greeting ||
 // Known callers get greeted by name before they say a word.
 const contact = fromNumber ? await lookupContact(fromNumber) : null;
 if (contact && contact.name) {
-const first = String(contact.name).trim().split(/s+/)[0];
+const first = String(contact.name).trim().split(/\s+/)[0];
 greeting = 'Hi ' + first + '! ' + greeting;
 console.log('[twiml] known caller ' + first + ', personalized greeting');
 }
