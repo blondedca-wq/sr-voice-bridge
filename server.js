@@ -1,8 +1,11 @@
 'use strict';
 // SecondRing Voice Receptionist - ConversationRelay bridge.
 // HTTP: /relay/incoming (TwiML), /relay/action (post-session handoff), /relay/health (JSON).
-// WS:   /relay/ws (Twilio ConversationRelay).
+// WS: /relay/ws (Twilio ConversationRelay).
 // Caddy terminates TLS and proxies /relay/* to this process.
+// Day 9: graceful SIGTERM/SIGINT shutdown - live callers get a polite wrap
+// line instead of dead air. A kill -9 is covered by the Twilio number's
+// fallback URL (the n8n Gather flow), not by code.
 
 const http = require('http');
 const { WebSocketServer } = require('ws');
@@ -18,124 +21,141 @@ const PUBLIC_HOST = process.env.PUBLIC_HOST || 'auto.secondring.ca';
 const FALLBACK_TWIML_URL = process.env.FALLBACK_TWIML_URL || '';
 
 function xmlEscape(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+.replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
 function fallbackTwiml() {
-  if (FALLBACK_TWIML_URL) {
-    return '<?xml version="1.0" encoding="UTF-8"?><Response><Redirect>' +
-      xmlEscape(FALLBACK_TWIML_URL) + '</Redirect></Response>';
-  }
-  return '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now. Please try again shortly.</Say></Response>';
+if (FALLBACK_TWIML_URL) {
+return '<?xml version="1.0" encoding="UTF-8"?><Response><Redirect>' +
+xmlEscape(FALLBACK_TWIML_URL) + '</Redirect></Response>';
+}
+return '<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we cannot take your call right now. Please try again shortly.</Say></Response>';
 }
 
 async function twimlFor(fromNumber) {
-  let cfg = null;
-  try { cfg = await loadConfig(); } catch (e) {
-    console.error('[twiml] config load failed: ' + e.message);
-  }
-  // The notch (tenant_machines):
-  //   autonomous / approval_required -> AI answers with full or gated actions.
-  //   observe (Watch, Day 8)         -> AI answers, records and grades, actions held.
-  //   paused / disabled              -> the n8n Gather flow takes the call untouched.
-  const live = cfg && cfg.enabled &&
-    (cfg.mode === 'approval_required' || cfg.mode === 'autonomous' || cfg.mode === 'observe');
-  if (!live) return fallbackTwiml();
+let cfg = null;
+try { cfg = await loadConfig(); } catch (e) {
+console.error('[twiml] config load failed: ' + e.message);
+}
+// The notch (tenant_machines):
+// autonomous / approval_required -> AI answers with full or gated actions.
+// observe (Watch, Day 8) -> AI answers, records and grades, actions held.
+// paused / disabled -> the n8n Gather flow takes the call untouched.
+const live = cfg && cfg.enabled &&
+(cfg.mode === 'approval_required' || cfg.mode === 'autonomous' || cfg.mode === 'observe');
+if (!live) return fallbackTwiml();
 
-  const kv = cfg.kv || {};
-  const p = cfg.profile || {};
-  let greeting = kv.greeting ||
-    ('Thanks for calling ' + (p.business_name || 'us') + '. How can I help you today?');
-  // Known callers get greeted by name before they say a word.
-  const contact = fromNumber ? await lookupContact(fromNumber) : null;
-  if (contact && contact.name) {
-    const first = String(contact.name).trim().split(/\s+/)[0];
-    greeting = 'Hi ' + first + '! ' + greeting;
-    console.log('[twiml] known caller ' + first + ', personalized greeting');
-  }
-  // machine_configs stores Say-style names like "Polly.Joanna-Neural";
-  // ConversationRelay wants ttsProvider="Amazon" voice="Joanna-Neural".
-  let voiceAttrs = '';
-  if (typeof kv.tts_voice === 'string' && kv.tts_voice.indexOf('Polly.') === 0) {
-    voiceAttrs = ' ttsProvider="Amazon" voice="' + xmlEscape(kv.tts_voice.slice(6)) + '"';
-  }
-  return '<?xml version="1.0" encoding="UTF-8"?><Response>' +
-    '<Connect action="https://' + PUBLIC_HOST + '/relay/action">' +
-    '<ConversationRelay url="wss://' + PUBLIC_HOST + '/relay/ws"' +
-    ' welcomeGreeting="' + xmlEscape(greeting) + '"' +
-    voiceAttrs +
-    ' interruptible="speech" dtmfDetection="true" />' +
-    '</Connect></Response>';
+const kv = cfg.kv || {};
+const p = cfg.profile || {};
+let greeting = kv.greeting ||
+('Thanks for calling ' + (p.business_name || 'us') + '. How can I help you today?');
+// Known callers get greeted by name before they say a word.
+const contact = fromNumber ? await lookupContact(fromNumber) : null;
+if (contact && contact.name) {
+const first = String(contact.name).trim().split(/s+/)[0];
+greeting = 'Hi ' + first + '! ' + greeting;
+console.log('[twiml] known caller ' + first + ', personalized greeting');
+}
+// machine_configs stores Say-style names like "Polly.Joanna-Neural";
+// ConversationRelay wants ttsProvider="Amazon" voice="Joanna-Neural".
+let voiceAttrs = '';
+if (typeof kv.tts_voice === 'string' && kv.tts_voice.indexOf('Polly.') === 0) {
+voiceAttrs = ' ttsProvider="Amazon" voice="' + xmlEscape(kv.tts_voice.slice(6)) + '"';
+}
+return '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+'<Connect action="https://' + PUBLIC_HOST + '/relay/action">' +
+'<ConversationRelay url="wss://' + PUBLIC_HOST + '/relay/ws"' +
+' welcomeGreeting="' + xmlEscape(greeting) + '"' +
+voiceAttrs +
+' interruptible="speech" dtmfDetection="true" />' +
+'</Connect></Response>';
 }
 
 // Called by Twilio when the ConversationRelay session ends. If the session
 // asked for a human, dial the escalation number; otherwise end the call.
 function actionTwiml(callSid) {
-  const h = callSid ? handoffs.get(callSid) : null;
-  if (h && h.handoff && h.number) {
-    handoffs.delete(callSid);
-    console.log('[action] handoff ' + callSid + ' -> ...' + String(h.number).slice(-4) + ' (' + h.reason + ')');
-    return '<?xml version="1.0" encoding="UTF-8"?><Response>' +
-      '<Dial timeout="25">' + xmlEscape(h.number) + '</Dial>' +
-      '<Say>Sorry, no one could pick up right now. The owner has your details and will call you straight back.</Say>' +
-      '</Response>';
-  }
-  return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>';
+const h = callSid ? handoffs.get(callSid) : null;
+if (h && h.handoff && h.number) {
+handoffs.delete(callSid);
+console.log('[action] handoff ' + callSid + ' -> ...' + String(h.number).slice(-4) + ' (' + h.reason + ')');
+return '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+'<Dial timeout="25">' + xmlEscape(h.number) + '</Dial>' +
+'<Say>Sorry, no one could pick up right now. The owner has your details and will call you straight back.</Say>' +
+'</Response>';
+}
+return '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>';
 }
 
 let liveSessions = 0;
 
 const server = http.createServer((req, res) => {
-  const url = (req.url || '').split('?')[0];
-  if (url === '/relay/health') {
-    const mem = process.memoryUsage();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      ok: true,
-      rss_mb: Math.round(mem.rss / 1048576),
-      sessions: liveSessions,
-      uptime_s: Math.round(process.uptime())
-    }));
-    return;
-  }
-  if (url === '/relay/incoming' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (d) => { body += d; });
-    req.on('end', async () => {
-      let from = null;
-      try { from = new URLSearchParams(body).get('From'); } catch {}
-      const twiml = await twimlFor(from);
-      res.writeHead(200, { 'Content-Type': 'text/xml' });
-      res.end(twiml);
-    });
-    return;
-  }
-  if (url === '/relay/action' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (d) => { body += d; });
-    req.on('end', () => {
-      let callSid = null;
-      try { callSid = new URLSearchParams(body).get('CallSid'); } catch {}
-      res.writeHead(200, { 'Content-Type': 'text/xml' });
-      res.end(actionTwiml(callSid));
-    });
-    return;
-  }
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('not found');
+const url = (req.url || '').split('?')[0];
+if (url === '/relay/health') {
+const mem = process.memoryUsage();
+res.writeHead(200, { 'Content-Type': 'application/json' });
+res.end(JSON.stringify({
+ok: true,
+rss_mb: Math.round(mem.rss / 1048576),
+sessions: liveSessions,
+uptime_s: Math.round(process.uptime())
+}));
+return;
+}
+if (url === '/relay/incoming' && req.method === 'POST') {
+let body = '';
+req.on('data', (d) => { body += d; });
+req.on('end', async () => {
+let from = null;
+try { from = new URLSearchParams(body).get('From'); } catch {}
+const twiml = await twimlFor(from);
+res.writeHead(200, { 'Content-Type': 'text/xml' });
+res.end(twiml);
+});
+return;
+}
+if (url === '/relay/action' && req.method === 'POST') {
+let body = '';
+req.on('data', (d) => { body += d; });
+req.on('end', () => {
+let callSid = null;
+try { callSid = new URLSearchParams(body).get('CallSid'); } catch {}
+res.writeHead(200, { 'Content-Type': 'text/xml' });
+res.end(actionTwiml(callSid));
+});
+return;
+}
+res.writeHead(404, { 'Content-Type': 'text/plain' });
+res.end('not found');
 });
 
 const wss = new WebSocketServer({ server, path: '/relay/ws' });
+const sessions = new Set();
 wss.on('connection', (ws) => {
-  liveSessions++;
-  new Session(ws);
-  ws.on('close', () => { liveSessions--; });
+liveSessions++;
+const s = new Session(ws);
+sessions.add(s);
+ws.on('close', () => { liveSessions--; sessions.delete(s); });
 });
 
 process.on('uncaughtException', (e) => console.error('[fatal-ish] ' + (e.stack || e.message)));
 process.on('unhandledRejection', (e) => console.error('[rejection] ' + (e && e.message ? e.message : e)));
 
+// Day 9: a deploy or restart must never strand a caller mid-sentence.
+let shuttingDown = false;
+function shutdown(sig) {
+if (shuttingDown) return;
+shuttingDown = true;
+console.log('[shutdown] ' + sig + ' - wrapping ' + sessions.size + ' live session(s)');
+for (const s of sessions) {
+try { s.gracefulEnd(); } catch (e) { console.error('[shutdown] ' + e.message); }
+}
+server.close(() => process.exit(0));
+setTimeout(() => process.exit(0), 4000);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 server.listen(PORT, BIND_HOST, () => {
-  console.log('sr-voice-bridge listening on ' + BIND_HOST + ':' + PORT + ' (public wss://' + PUBLIC_HOST + '/relay/ws)');
+console.log('sr-voice-bridge listening on ' + BIND_HOST + ':' + PORT + ' (public wss://' + PUBLIC_HOST + '/relay/ws)');
 });
